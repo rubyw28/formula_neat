@@ -5,7 +5,18 @@ battery deployment, manual override, tyre wear, and a grip model that crashes a
 car when it asks more of the tyres than they have — on 18 real Formula 1
 circuits built from actual track geometry.
 
+![A trained network racing at Silverstone](assets/demo/silverstone.gif)
+
+*Ten copies of one trained network through Becketts at Silverstone, with live
+telemetry: speed, lateral g, how much of the available grip is being used,
+battery drain and tyre wear. Recorded with `--record`, below.*
+
+<details>
+<summary>The same thing running in a window, on Monza</summary>
+
 ![Formula NEAT running on Monza](foormula_neat_running.png)
+
+</details>
 
 ## Quick start
 
@@ -21,6 +32,19 @@ python main.py --replay best_oval.pkl
 The best genome of a run is written to `best_<track>.pkl` whenever it improves.
 The file records the score it earned, and a later run will not overwrite it with
 anything worse — delete it, or pass `--save-best`, to start a fresh record.
+
+### Recording
+
+```powershell
+python main.py --track britain --replay best_britain.pkl --headless ^
+  --replay-cars 10 --record demo.gif --record-seconds 9
+```
+
+`--record` writes an animated GIF of a training run or a replay. With
+`--headless` it renders to an offscreen canvas, so a clip is captured as fast as
+the machine manages rather than in real time. `--record-every`, `--record-width`
+and `--record-seconds` control the rest. Recording needs Pillow; the simulation
+itself does not.
 
 While a window is open:
 
@@ -148,6 +172,7 @@ python tools/calibrate.py britain
 | `tools/build_tracks.py` | turn geometry or art into a drivable track + metadata |
 | `tools/preview_track.py` | draw that metadata over the image, to check it |
 | `tools/calibrate.py` | what the physics constants mean on a real track |
+| `recorder.py` | GIF capture for `--record` (needs Pillow) |
 | `newcar.py` | the original baseline, frozen (see below) |
 | `config_baseline.txt` | NEAT settings for that baseline (5 in, 6 out) |
 
@@ -274,6 +299,27 @@ for the whole run, and a genome leaning on that input drove straight into a wall
 — scoring 36 where training scored 1484. Replay now clones the genome across a
 small grid (`--replay-cars`).
 
+**The apex bonus paid per tick, not per apex.** `reward_apex` was awarded on
+every tick a car was within 25px of an apex, so the highest-scoring thing a car
+could do was stop on one: 572 over the stall window, against 216 for driving 12
+of Silverstone's 29 checkpoints. Training found it — the best genome after 250
+generations scored 551.9 having never reached a single checkpoint. It is now
+claimed once per apex per lap, like a checkpoint. That was the third instance of
+the same failure: a per-tick reward for *being* somewhere out-earning the reward
+for *going* somewhere.
+
+**Drag has to balance above the highest speed cap.** Balanced at the base cap,
+X mode stayed drag-limited below its own limit — so it bought a few km/h while
+costing 28% of grip, and no network had any reason to select it. Drag is now set
+from the highest attainable speed, so every cap binds: 320 km/h in Z, 346 in X,
+364 with the override, 263 on a flat battery.
+
+**The telemetry panel moves to the quietest corner.** Fixed at the top left it
+sat on top of the track on any circuit that runs through that corner — at
+Silverstone the whole pack vanished behind it for seconds. `Track.quietest_corner()`
+samples the track image and picks the emptiest of the four corners or the middle,
+which for a ring-shaped circuit is the infield.
+
 **Override cooldown self-cancels.** `car.py` stamps `last_override_tick` on every
 tick the override is *active*, so any non-zero `override_cooldown_ticks` makes it
 fire for one tick then lock itself out. It is set to `0`; battery drain is the
@@ -283,7 +329,10 @@ real limiter. A proper fix would stamp only when the override *starts*.
 
 - Python 3.9+
 - `pygame`, `neat-python`
-- `numpy`, but only for `tools/build_tracks.py`. The simulation does not need it.
+- `numpy`, but only for `tools/build_tracks.py`
+- `Pillow`, but only for `--record`
+
+The simulation itself needs neither.
 
 ## Credits
 

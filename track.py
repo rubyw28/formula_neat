@@ -70,6 +70,43 @@ class Track:
                 self.clearance = pygame.image.load(path).convert()
         return self
 
+    def quietest_corner(self, width_frac=0.30, height_frac=0.46, step=4):
+        """Which corner of the frame has the least track under it.
+
+        The telemetry panel has to go somewhere, and a fixed corner hides cars
+        on any circuit that happens to run through it - on Silverstone the whole
+        pack disappeared behind it for seconds at a time. Sampling the track
+        image picks the emptiest corner per track instead.
+
+        Returns (x_fraction, y_fraction) for where the panel should sit.
+        """
+        if self.surface is None:
+            return (0.0, 0.0)
+        width, height = self.resolution
+        panel_w = int(width * width_frac)
+        panel_h = int(height * height_frac)
+
+        # The four corners, plus the middle: a ring-shaped circuit has a large
+        # empty infield, which is usually the best place of all for the panel.
+        corners = {
+            (0.0, 0.0): (0, 0),
+            (1.0, 0.0): (width - panel_w, 0),
+            (0.0, 1.0): (0, height - panel_h),
+            (1.0, 1.0): (width - panel_w, height - panel_h),
+            (0.5, 0.5): ((width - panel_w) // 2, (height - panel_h) // 2),
+        }
+        best_key, best_count = (0.0, 0.0), None
+        for key, (x0, y0) in corners.items():
+            count = 0
+            for y in range(y0, y0 + panel_h, step):
+                for x in range(x0, x0 + panel_w, step):
+                    pixel = self.surface.get_at((x, y))
+                    if pixel[0] < 200 or pixel[1] < 200 or pixel[2] < 200:
+                        count += 1
+            if best_count is None or count < best_count:
+                best_key, best_count = key, count
+        return best_key
+
     def car_meta(self):
         """The subset `car.py` reads out of a track."""
         return {

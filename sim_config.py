@@ -206,9 +206,16 @@ def cfg_for_track(track_meta, real=None, **overrides):
     cfg["engine_accel"] = accel(values["engine_accel_mps2"])
     cfg["brake_decel"] = accel(values["brake_decel_mps2"])
     cfg["override_boost"] = accel(values["override_boost_mps2"])
-    # Drag balances full power a shade above top speed, so the car accelerates
-    # asymptotically instead of slamming into the clamp.
-    terminal = cfg["max_speed_base"] * 1.02
+    # Drag balances full power a shade above the HIGHEST attainable speed, so
+    # the car accelerates asymptotically towards each mode's cap rather than
+    # slamming into it - and, importantly, so every cap is actually reachable.
+    # Balancing at the base cap instead leaves X mode drag-limited below its
+    # own limit, which makes X pure downside: it pays 28% grip for a few km/h.
+    terminal = (
+        cfg["max_speed_base"]
+        + cfg["x_mode_speed_bonus"]
+        + cfg["override_speed_bonus"]
+    ) * 1.02
     cfg["drag_coeff"] = cfg["engine_accel"] / (terminal * terminal)
 
     # Force is already physical, so it needs no conversion at all - which is

@@ -173,6 +173,8 @@ class Simulation:
         self.debug = args.debug
         self.ticks_per_frame = 1
         self.hud_scale = 1.0
+        # Where the telemetry panel sits, as (x, y) fractions of the frame.
+        self.hud_anchor = (0.0, 0.0)
         self.started = time.time()
         # "GEN" while training, "RUN" while replaying a saved genome.
         self.round_label = "GEN"
@@ -454,7 +456,15 @@ class Simulation:
                 WARN if load > 0.85 else INK,
             )
 
-        surface.blit(panel, (u(24), u(24)))
+        margin = u(24)
+        ax, ay = self.hud_anchor
+        surface.blit(
+            panel,
+            (
+                int(ax * (surface.get_width() - width - 2 * margin)) + margin,
+                int(ay * (surface.get_height() - height - 2 * margin)) + margin,
+            ),
+        )
 
     def _bar(self, panel, x, y, width, label, value, colour):
         """A labelled meter. Coordinates are in unscaled design units."""
@@ -521,6 +531,7 @@ def replay(args, cfg, track, screen, world, fonts, canvas=None, recorder=None,
 
     sim = Simulation(args, cfg, track, screen, world, fonts, canvas, recorder)
     sim.hud_scale = hud_scale
+    sim.hud_anchor = track.quietest_corner()
     sim.round_label = "RUN"
     clock = pygame.time.Clock()
     meta = track.car_meta()
@@ -724,6 +735,7 @@ def main(argv=None):
 
     sim = Simulation(args, cfg, track, screen, world, fonts, canvas, recorder)
     sim.hud_scale = hud_scale
+    sim.hud_anchor = track.quietest_corner()
     sim.best_fitness = sim_best
     try:
         population.run(sim.evaluate, args.generations)
