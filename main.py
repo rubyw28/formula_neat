@@ -24,14 +24,14 @@ import sys
 import time
 
 from car import Car
-from sim_config import make_cfg
+from sim_config import cfg_for_track
 from track import Track
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-PANEL_BG = (16, 18, 22, 215)
+PANEL_BG = (14, 16, 20, 242)
 INK = (236, 238, 242)
-DIM = (150, 156, 168)
+DIM = (178, 185, 199)
 ACCENT = (0, 200, 255)
 WARN = (255, 172, 40)
 GOOD = (90, 220, 130)
@@ -52,8 +52,9 @@ def parse_args(argv):
     parser.add_argument(
         "--ticks",
         type=int,
-        default=1200,
-        help="simulation ticks per generation (default: 1200, about two laps)",
+        default=None,
+        help="simulation ticks per generation (default: sized from the track, "
+        "enough for about a lap and a half)",
     )
     parser.add_argument(
         "--stall-ticks",
@@ -83,6 +84,13 @@ def parse_args(argv):
         "(default: best_<track>.pkl)",
     )
     parser.add_argument("--replay", default=None, help="watch a saved genome instead")
+    parser.add_argument(
+        "--replay-cars",
+        type=int,
+        default=6,
+        help="how many clones of the genome to field when replaying (default: 6, "
+        "so the 'override available' input behaves as it did in training)",
+    )
     parser.add_argument("--seed", type=int, default=None, help="random seed")
     return parser.parse_args(argv)
 
@@ -152,12 +160,20 @@ class Simulation:
         slots = self.track.grid_slots(len(genomes), cfg)
         meta = self.track.car_meta()
 
+        # A car starting at the back of the grid has to cover the whole grid
+        # before checkpoint 0 even counts, so it gets that time on top of the
+        # stall budget. Without this the back rows were retired on a timer
+        # whatever their genome did - 13 of 40 slots on the oval.
+        pace = cfg["max_speed_base"] * 0.4
+
         nets, cars = [], []
         for index, (_, genome) in enumerate(genomes):
             genome.fitness = 0.0
             nets.append(neat.nn.FeedForwardNetwork.create(genome, neat_config))
-            x, y, angle = slots[index]
-            cars.append(Car(x, y, angle, meta, cfg))
+            slot = slots[index]
+            car = Car(slot["x"], slot["y"], slot["angle"], meta, cfg)
+            car.spawn_grace = int(slot["behind_px"] / pace)
+            cars.append(car)
 
         clock = pygame.time.Clock() if not self.args.headless else None
         skip = False
@@ -197,7 +213,8 @@ class Simulation:
                 continue
             # A car that stops making progress is retired rather than left to
             # idle out the generation collecting racing-line reward.
-            if car.time - car.last_checkpoint_tick > self.args.stall_ticks:
+            grace = self.args.stall_ticks + getattr(car, "spawn_grace", 0)
+            if car.time - car.last_checkpoint_tick > grace:
                 car.alive = False
                 continue
 
@@ -233,7 +250,15 @@ class Simulation:
             self.best_fitness = fitness
             if self.args.save_best:
                 with open(self.args.save_best, "wb") as handle:
-                    pickle.dump(best[1], handle)
+                    pickle.dump(
+                        {
+                            "genome": best[1],
+                            "fitness": fitness,
+                            "track": self.track.name,
+                            "generation": self.generation,
+                        },
+                        handle,
+                    )
 
         print(
             f"  gen {self.generation:>4} | best {fitness:9.1f} | "
@@ -279,15 +304,20 @@ class Simulation:
             if car.is_alive():
                 car.draw(world, self.debug)
 
+        # Scale the track and cars down to the window FIRST, then draw the HUD
+        # on top at the window's own resolution. Drawing the HUD into the
+        # 1920x1080 world surface sent its text through the same downscale as
+        # the track, and at the 0.725 a 1512px-wide desktop forces, 14px glyphs
+        # came out mangled - "BATTERY" rendered as "BATTFRY". smoothscale rather
+        # than scale so the track edges and the car sprite survive the shrink.
+        if world is not self.screen:
+            pygame.transform.smoothscale(world, self.screen.get_size(), self.screen)
+
         leader = self._leader(cars)
         if self.show_hud:
-            self._draw_hud(world, leader, tick, alive, total)
+            self._draw_hud(self.screen, leader, tick, alive, total)
 
-        if world is self.screen:
-            pygame.display.flip()
-        else:
-            pygame.transform.scale(world, self.screen.get_size(), self.screen)
-            pygame.display.flip()
+        pygame.display.flip()
 
     def _draw_track_debug(self, surface):
         import pygame
@@ -315,7 +345,7 @@ class Simulation:
         import pygame
 
         small, body, big = self.fonts
-        width, height = 330, 300
+        width, height = 372, 310
         panel = pygame.Surface((width, height), pygame.SRCALPHA)
         panel.fill(PANEL_BG)
 
@@ -341,8 +371,8 @@ class Simulation:
         else:
             kmh = leader.speed * self.cfg["pixel_to_meter"] * self.cfg["fps"] * 3.6
             mode = leader.aero_mode
-            text(big, f"{kmh:4.0f}", 16, 166)
-            text(small, "km/h", 88, 190, DIM)
+            text(big, f"{kmh:4.0f}", 12, 164)
+            text(small, "km/h", 96, 194, DIM)
 
             text(body, f"AERO {mode}", 150, 168, WARN if mode == "X" else GOOD)
             override = (
@@ -362,14 +392,16 @@ class Simulation:
             self._bar(panel, 16, 246, width - 32, "TYRE", 1.0 - leader.tire_wear, GOOD)
 
             load = leader.corner_load_ratio
+            # Values are clamped for display: a car mid-crash can post a
+            # three-figure g reading, which would run off the panel.
             text(
-                small,
-                f"lap {leader.completed_laps}   cp {leader.next_checkpoint}/"
-                f"{len(self.track.meta['checkpoints'])}   "
-                f"{leader.g_force:.1f}g   grip {load * 100:3.0f}%",
+                body,
+                f"lap {leader.completed_laps:<2d} cp {leader.next_checkpoint:>2d}/"
+                f"{len(self.track.meta['checkpoints']):<2d} "
+                f"{min(leader.g_force, 99.9):4.1f}g  grip {min(load, 9.99) * 100:3.0f}%",
                 16,
-                276,
-                WARN if load > 0.85 else DIM,
+                280,
+                WARN if load > 0.85 else INK,
             )
 
         surface.blit(panel, (24, 24))
@@ -400,14 +432,32 @@ class Simulation:
 # --------------------------------------------------------------------------
 
 
+def load_genome(path):
+    """Read a saved genome. Returns (genome, metadata-or-None)."""
+    try:
+        with open(path, "rb") as handle:
+            payload = pickle.load(handle)
+    except FileNotFoundError:
+        raise SystemExit(f"no saved genome at {path}")
+    except (pickle.UnpicklingError, EOFError, AttributeError) as error:
+        raise SystemExit(f"could not read {path}: {error}")
+    if isinstance(payload, dict) and "genome" in payload:
+        return payload["genome"], payload
+    return payload, None
+
+
 def replay(args, cfg, track, screen, world, fonts):
     """Drive a saved genome around the track on repeat."""
     import neat
     import pygame
 
     neat_config = load_neat_config(args.config)
-    with open(args.replay, "rb") as handle:
-        genome = pickle.load(handle)
+    genome, saved = load_genome(args.replay)
+    if saved:
+        print(
+            f"  {os.path.basename(args.replay)}: fitness {saved['fitness']:.1f} "
+            f"on {saved['track']}, generation {saved['generation']}"
+        )
     net = neat.nn.FeedForwardNetwork.create(genome, neat_config)
 
     sim = Simulation(args, cfg, track, screen, world, fonts)
@@ -417,28 +467,55 @@ def replay(args, cfg, track, screen, world, fonts):
 
     while True:
         sim.generation += 1
-        x, y, angle = track.grid_slots(1, cfg)[0]
-        car = Car(x, y, angle, meta, cfg)
+        # A field, not a lone car. Training runs 40 cars nose to tail, which
+        # keeps the "override available" input pinned at 1; replaying a single
+        # car flips that input to 0 for the whole run and a genome that leans on
+        # it drives straight into a wall. Cloning the genome across a small grid
+        # reproduces the conditions it was actually scored under.
+        slots = track.grid_slots(args.replay_cars, cfg)
+        cars = []
+        for slot in slots:
+            car = Car(slot["x"], slot["y"], slot["angle"], meta, cfg)
+            car.spawn_grace = int(slot["behind_px"] / (cfg["max_speed_base"] * 0.4))
+            cars.append(car)
         fitness = 0.0
+
         for tick in range(args.ticks):
-            if sim.handle_events():
+            if not args.headless and sim.handle_events():
                 break
-            car.update(track.surface, track.border_mask, net.activate(car.get_data()),
-                       None, tick)
-            if not car.is_alive():
+            rivals = [(i, c.center) for i, c in enumerate(cars) if c.is_alive()]
+            alive = 0
+            for index, car in enumerate(cars):
+                if not car.is_alive():
+                    continue
+                nearest = sim._nearest_rival(index, car.center, rivals)
+                car.update(track.surface, track.border_mask,
+                           net.activate(car.get_data()), nearest, tick)
+                if not car.is_alive():
+                    continue
+                grace = args.stall_ticks + getattr(car, "spawn_grace", 0)
+                if car.time - car.last_checkpoint_tick > grace:
+                    car.alive = False
+                    continue
+                alive += 1
+                if index == 0:
+                    fitness += car.get_reward()
+            if alive == 0:
                 break
-            fitness += car.get_reward()
-            sim.best_laps = max(sim.best_laps, car.completed_laps)
+            sim.best_laps = max(sim.best_laps, max(c.completed_laps for c in cars))
             sim.best_fitness = max(sim.best_fitness, fitness)
-            if tick % sim.ticks_per_frame == 0:
-                sim.render([car], tick, 1, 1)
+            if not args.headless and tick % sim.ticks_per_frame == 0:
+                sim.render(cars, tick, alive, len(cars))
                 clock.tick(args.fps)
+
+        leader = max(cars, key=lambda c: (c.completed_laps, c.next_checkpoint))
         print(
-            f"  run {sim.generation:>3} | {fitness:9.1f} | "
-            f"{car.completed_laps} laps | "
-            f"{'finished the run' if car.is_alive() else 'crashed'} "
-            f"after {car.time} ticks"
+            f"  run {sim.generation:>3} | pole car {fitness:9.1f} | "
+            f"best of field: {leader.completed_laps} laps, "
+            f"{leader.next_checkpoint}/{len(track.meta['checkpoints'])} checkpoints"
         )
+        if args.headless:
+            return 0
 
 
 # --------------------------------------------------------------------------
@@ -458,16 +535,16 @@ def main(argv=None):
         random.seed(args.seed)
 
     pygame.init()
-    # Deliberately not make_cfg(fps=args.fps): sim_config's `fps` is a physics
-    # constant, the one that turns px/tick into m/s for the force model. Letting
-    # a render cap move it would rescale every speed, g-force and grip limit.
-    cfg = make_cfg()
-
     try:
         track = Track(args.track)
     except FileNotFoundError as error:
         raise SystemExit(str(error))
 
+    # The config is built FROM the track: each one carries its own car size and
+    # metres-per-pixel, and sim_config converts the real-world physics into that
+    # track's pixel units. Note fps is not taken from --fps - it is the physics
+    # tick rate, and moving it would rescale every speed, force and grip limit.
+    cfg = cfg_for_track(track.meta)
     world_size = track.resolution
     cfg["screen_width"], cfg["screen_height"] = world_size
 
@@ -491,12 +568,23 @@ def main(argv=None):
 
     track.load(cfg["border_color"])
     cfg["car_sprite_path"] = os.path.join(ROOT, cfg["car_sprite_path"])
+    cfg["clearance_field"] = track.clearance
 
+    if args.ticks is None:
+        # Circuits differ hugely in length once they are drawn at their own
+        # scale - the oval is 4029px, Shanghai 6178px - so a fixed budget either
+        # wastes time or cuts the long ones off mid-lap. A competent car
+        # averages roughly 45% of top speed once corners are accounted for.
+        pace = cfg["max_speed_base"] * 0.45
+        args.ticks = int(min(6000, max(900, round(track.length_px / pace * 1.7))))
+
+    # Sized for the window's own pixels, since the HUD is drawn after the
+    # world is scaled down rather than being scaled along with it.
     mono = "menlo,consolas,dejavusansmono,couriernew,monospace"
     fonts = (
-        pygame.font.SysFont(mono, 14),
-        pygame.font.SysFont(mono, 16),
-        pygame.font.SysFont(mono, 28, bold=True),
+        pygame.font.SysFont(mono, 15),
+        pygame.font.SysFont(mono, 17),
+        pygame.font.SysFont(mono, 30, bold=True),
     )
 
     if args.replay:
@@ -504,6 +592,23 @@ def main(argv=None):
 
     if args.save_best is None:
         args.save_best = os.path.join(ROOT, f"best_{track.name}.pkl")
+
+    sim_best = float("-inf")
+    if os.path.exists(args.save_best):
+        # Carry the stored score forward so a short run cannot overwrite a good
+        # genome with a worse one just by existing. Delete the file, or pass
+        # --save-best elsewhere, to start the record fresh.
+        try:
+            _, stored = load_genome(args.save_best)
+        except SystemExit:
+            stored = None
+        if stored:
+            sim_best = stored["fitness"]
+            print(
+                f"{os.path.basename(args.save_best)} already holds "
+                f"fitness {sim_best:.1f} from generation {stored['generation']}; "
+                f"it will only be replaced by something better."
+            )
 
     import neat
 
@@ -520,6 +625,7 @@ def main(argv=None):
     )
 
     sim = Simulation(args, cfg, track, screen, world, fonts)
+    sim.best_fitness = sim_best
     population.run(sim.evaluate, args.generations)
     return 0
 

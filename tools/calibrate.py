@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sim_config import SIM_CFG  # noqa: E402
+from sim_config import cfg_for_track  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MASS_KG = 768.0      # matches car.py
@@ -114,16 +114,20 @@ def path_radii(line, stencil=4):
     return radii
 
 
-def report(cfg, name):
+def report(name):
     with open(os.path.join(ROOT, "assets", "tracks", f"{name}.json")) as handle:
         meta = json.load(handle)
+    cfg = cfg_for_track(meta)
     line = smooth_line(meta["racing_line"])
     radii = sorted_radii = path_radii(line)
     spacing = meta["length_px"] / len(line)
 
     print(f"\n=== {name} ===")
-    print(f"  lap {meta['length_px']}px, width ~{meta['median_width_px']}px, "
-          f"{len(line)} racing-line points ({spacing:.0f}px apart)")
+    print(f"  lap {meta['length_px']}px = {meta.get('lap_m', 0)}m, "
+          f"band {meta['median_width_px']}px "
+          f"({meta.get('width_in_cars', 0)} cars), "
+          f"car {cfg['car_size_x']}x{cfg['car_size_y']}px, "
+          f"{cfg['pixel_to_meter']:.4f} m/px")
 
     top = cfg["max_speed_base"]
     top_x = top + cfg["x_mode_speed_bonus"]
@@ -159,8 +163,15 @@ def main():
     parser.add_argument("tracks", nargs="*", default=None)
     args = parser.parse_args()
 
-    names = args.tracks or ["oval", "monza"]
-    worst = max(report(SIM_CFG, name) for name in names)
+    if args.tracks:
+        names = args.tracks
+    else:
+        names = sorted(
+            os.path.splitext(f)[0]
+            for f in os.listdir(os.path.join(ROOT, "assets", "tracks"))
+            if f.endswith(".json")
+        )
+    worst = max(report(name) for name in names)
     print(f"\nSuggested per-generation budget: >= {int(worst * 1.6)} ticks "
           f"to give a competent car time for a lap and a bit.\n")
     return 0

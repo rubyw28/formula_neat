@@ -36,6 +36,9 @@ def render(meta, scale):
     for i, cp in enumerate(meta["checkpoints"]):
         pygame.draw.circle(surface, (0, 200, 255), (cp["x"], cp["y"]), cp["radius"], 3)
         label = font.render(str(i), True, (0, 200, 255))
+        # render() hands back an opaque surface here, which would paint a black
+        # box over the track; key the background out.
+        label.set_colorkey((0, 0, 0))
         surface.blit(label, (cp["x"] + 6, cp["y"] + 6))
 
     spawn = meta["spawn"]

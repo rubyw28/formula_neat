@@ -327,7 +327,32 @@ def pick_apexes(points, min_gap):
 # metadata build
 # --------------------------------------------------------------------------
 
-def build_meta(image_path, name, line_spacing, checkpoint_spacing, spawn_hint=None):
+# A 2026-regulation car, and how a real track compares to it. A Formula 1
+# track is about 12m wide and a car about 2.0m, so the track is roughly six
+# cars wide and 2.13 car-lengths wide. Sizing the car from each track's own
+# band keeps that proportion right whatever scale the circuit came out at.
+CAR_LENGTH_M = 5.63
+CAR_WIDTH_M = 2.00
+TRACK_WIDTH_IN_CARS = 6.0
+MIN_CAR_WIDTH_PX = 7
+
+
+def car_for_track(track_width_px):
+    """Car size in pixels, and the metre scale that makes it a real F1 car."""
+    car_width = max(MIN_CAR_WIDTH_PX, int(round(track_width_px / TRACK_WIDTH_IN_CARS)))
+    car_length = int(round(car_width * (CAR_LENGTH_M / CAR_WIDTH_M)))
+    return {
+        "size_x": car_length,
+        "size_y": car_width,
+        "length_m": CAR_LENGTH_M,
+        "width_m": CAR_WIDTH_M,
+        # One pixel in metres, anchored so the car is exactly a real car.
+        "pixel_to_meter": round(CAR_LENGTH_M / car_length, 5),
+    }
+
+
+def build_meta(image_path, name, line_spacing, checkpoint_spacing, spawn_hint=None,
+               extra=None):
     rgb = load_rgb(image_path)
     band = drivable_mask(rgb)
     height, width = band.shape
@@ -363,37 +388,54 @@ def build_meta(image_path, name, line_spacing, checkpoint_spacing, spawn_hint=No
     tangents = np.roll(tangents, -start, axis=0)
     widths = np.roll(widths, -start)
 
-    step = max(1, int(round(checkpoint_spacing / line_spacing)))
+    # Evenly spaced around the whole loop, so the last gap matches the rest
+    # instead of whatever the loop length happened to leave over. Offset by half
+    # a gap so checkpoint 0 is not sitting on the spawn point, where the front
+    # row would collect it for free on tick zero.
+    count = max(4, int(round(len(line) / (checkpoint_spacing / line_spacing))))
     checkpoints = []
-    for i in range(0, len(line), step):
+    for k in range(count):
+        i = int(round((k + 0.5) * len(line) / count)) % len(line)
+        # Radius has to reach past the edge of the track, or a car running wide
+        # drives straight past the checkpoint without ever registering it.
+        radius = min(max(widths[i] * 0.62, 26.0), 120.0)
         checkpoints.append(
             {
                 "x": int(round(line[i][0])),
                 "y": int(round(line[i][1])),
-                "radius": int(round(min(max(widths[i] * 0.5, 26.0), 75.0))),
+                "radius": int(round(radius)),
             }
         )
 
     spawn_angle = -math.degrees(math.atan2(tangents[0][1], tangents[0][0])) % 360
 
-    return {
+    median_width = float(np.median(widths))
+    car = car_for_track(median_width)
+
+    meta = {
         "name": name,
         "image": os.path.relpath(image_path, ROOT).replace(os.sep, "/"),
         "resolution": [int(width), int(height)],
         "generated_by": "tools/build_tracks.py",
+        "car": car,
         "spawn": {
             "x": int(round(line[0][0])),
             "y": int(round(line[0][1])),
             "angle": round(spawn_angle, 2),
         },
         "length_px": int(round(length)),
-        "median_width_px": int(round(float(np.median(widths)))),
+        "median_width_px": int(round(median_width)),
+        "width_in_cars": round(median_width / car["size_y"], 2),
+        "lap_m": int(round(length * car["pixel_to_meter"])),
         "checkpoints": checkpoints,
         "racing_line": [[int(round(p[0])), int(round(p[1]))] for p in line],
         # Apexes must be at least ~250px of track apart so one corner
         # does not register as several.
         "apex_indices": pick_apexes(line, min_gap=max(4, int(250 / line_spacing))),
     }
+    if extra:
+        meta.update(extra)
+    return meta
 
 
 # --------------------------------------------------------------------------
@@ -417,42 +459,115 @@ def min_self_clearance(points, ignore_span):
     return float(gaps.min())
 
 
-def paint_track_from_outline(outline_path, out_path, half_width):
-    """Trace the outline art and paint a drivable track band along it.
+def paint_band(points, size, half_width):
+    """Paint a drivable band of the given half-width along a centreline."""
+    surface = pygame.Surface(size)
+    surface.fill((255, 255, 255))
+    whole = [(int(round(p[0])), int(round(p[1]))) for p in points]
+    for i in range(len(whole)):
+        pygame.draw.line(
+            surface, (0, 0, 0), whole[i], whole[(i + 1) % len(whole)], half_width * 2
+        )
+        pygame.draw.circle(surface, (0, 0, 0), whole[i], half_width)
+    return surface
 
-    Returns the half-width actually used. The requested width is capped by the
-    circuit's own self-clearance, then reduced further if the painted result
-    fails to reproduce the source lap.
+
+def paint_track(points, size, source_length, out_path, half_width, floor):
+    """Paint a centreline into a drivable track image, as wide as will fit.
+
+    The requested half-width is first capped by the circuit's own self-clearance,
+    then reduced until the painted result still reproduces the source lap.
+    Returns the half-width used, or None if even `floor` welds the track shut.
     """
-    rgb = load_rgb(outline_path)
-    band = drivable_mask(rgb)
-    center = smooth_closed(centerline_of(band), 15)
-    center, source_length = resample_closed(center, 6.0)
-    center = smooth_closed(center, 9)
+    spacing = source_length / len(points)
+    clearance = min_self_clearance(points, ignore_span=max(2, int(200 / spacing)))
+    half_width = min(half_width, int(clearance / 2) - 5)
 
-    spacing = source_length / len(center)
-    clearance = min_self_clearance(center, ignore_span=int(200 / spacing))
-    half_width = min(half_width, int(clearance / 2) - 6)
-
-    width, height = rgb.shape[1], rgb.shape[0]
-    points = [(int(round(p[0])), int(round(p[1]))) for p in center]
-
-    while half_width >= 20:
-        surface = pygame.Surface((width, height))
-        surface.fill((255, 255, 255))
-        for i in range(len(points)):
-            a, b = points[i], points[(i + 1) % len(points)]
-            pygame.draw.line(surface, (0, 0, 0), a, b, half_width * 2)
-            pygame.draw.circle(surface, (0, 0, 0), a, half_width)
-
+    while half_width >= floor:
+        surface = paint_band(points, size, half_width)
         painted = drivable_mask(
             np.transpose(pygame.surfarray.array3d(surface), (1, 0, 2))
         )
         if _reproduces_lap(painted, source_length):
             pygame.image.save(surface, out_path)
             return half_width
-        half_width -= 5
-    raise RuntimeError("could not paint a self-avoiding track from the outline")
+        half_width -= 3
+    return None
+
+
+def outline_centerline(outline_path):
+    """Centreline traced out of thin outline art, plus the frame it lives in."""
+    rgb = load_rgb(outline_path)
+    band = drivable_mask(rgb)
+    center = smooth_closed(centerline_of(band), 15)
+    center, length = resample_closed(center, 6.0)
+    center = smooth_closed(center, 9)
+    return center, length, (rgb.shape[1], rgb.shape[0])
+
+
+EARTH_RADIUS_M = 6371000.0
+
+
+def centerline_from_geojson(path, size, margin):
+    """Project a real circuit's GeoJSON centreline into the pixel frame.
+
+    Circuit maps have no canonical rotation, and a tall circuit dropped into a
+    16:9 frame wastes most of it, so the loop is turned to whichever orientation
+    fits largest.
+    """
+    with open(path) as handle:
+        payload = json.load(handle)
+    feature = payload["features"][0]
+    geometry = feature["geometry"]
+    coords = geometry["coordinates"]
+    if geometry["type"] == "MultiLineString":
+        coords = max(coords, key=len)
+    if coords[0] == coords[-1]:
+        coords = coords[:-1]
+
+    # Equirectangular about the circuit's own centroid. Over a few kilometres
+    # the distortion is far smaller than the pixel we round to.
+    lat0 = sum(point[1] for point in coords) / len(coords)
+    scale_lon = math.cos(math.radians(lat0))
+    metres = np.array(
+        [
+            [
+                EARTH_RADIUS_M * math.radians(point[0]) * scale_lon,
+                -EARTH_RADIUS_M * math.radians(point[1]),  # screen y grows downward
+            ]
+            for point in coords
+        ]
+    )
+    measured_m = _polyline_length([tuple(p) for p in metres])
+
+    width, height = size
+    best = None
+    for degrees in range(0, 180):
+        angle = math.radians(degrees)
+        turned = metres @ np.array(
+            [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]]
+        )
+        span_x = max(float(np.ptp(turned[:, 0])), 1e-6)
+        span_y = max(float(np.ptp(turned[:, 1])), 1e-6)
+        scale = min((width - 2 * margin) / span_x, (height - 2 * margin) / span_y)
+        if best is None or scale > best[0]:
+            best = (scale, degrees, turned)
+
+    scale, degrees, turned = best
+    pixels = turned * scale
+    pixels[:, 0] += width / 2.0 - (pixels[:, 0].min() + pixels[:, 0].max()) / 2.0
+    pixels[:, 1] += height / 2.0 - (pixels[:, 1].min() + pixels[:, 1].max()) / 2.0
+
+    pixels, lap_px = resample_closed(pixels, 5.0)
+    pixels = smooth_closed(pixels, 7)
+
+    info = {
+        "circuit": feature["properties"].get("Name"),
+        "official_length_m": feature["properties"].get("length"),
+        "measured_length_m": int(round(measured_m)),
+        "rotated_deg": degrees,
+    }
+    return pixels, lap_px, info
 
 
 def _reproduces_lap(band, source_length):
@@ -470,6 +585,79 @@ def _reproduces_lap(band, source_length):
     except RuntimeError:
         return False
     return lap > source_length * 0.90
+
+
+# Sampled from the start/finish line painted into map.png, so a generated
+# track's line matches the hand-drawn one. Both are safely below the white
+# cutoff, so painting them changes nothing about where the car may drive.
+START_LINE_LIGHT = (163, 193, 160)
+START_LINE_DARK = (20, 77, 0)
+
+
+def paint_start_line(image_path, spawn, half_width, depth=56, square=14):
+    """Paint a checkered start/finish line across the track at the spawn point.
+
+    Only pixels that are already drivable are recoloured, and only in colours
+    that stay drivable, so the track's shape and collision mask are untouched -
+    this is purely so you can see where the lap begins.
+    """
+    rgb = load_rgb(image_path)
+    band = drivable_mask(rgb)
+    height, width = band.shape
+
+    # car.py's angle convention: travel is along (cos(360-a), sin(360-a)).
+    heading = math.radians(360 - spawn["angle"])
+    along = (math.cos(heading), math.sin(heading))
+    across = (-along[1], along[0])
+
+    reach = int(depth + 2 * half_width + 8)
+    x0 = max(0, spawn["x"] - reach)
+    x1 = min(width, spawn["x"] + reach)
+    y0 = max(0, spawn["y"] - reach)
+    y1 = min(height, spawn["y"] + reach)
+
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    dx = xs - spawn["x"]
+    dy = ys - spawn["y"]
+    u = dx * along[0] + dy * along[1]       # distance along the track
+    v = dx * across[0] + dy * across[1]     # distance across it
+
+    span = half_width + 8
+    on_line = (np.abs(u) <= depth / 2.0) & (np.abs(v) <= span) & band[y0:y1, x0:x1]
+    light = (
+        (np.floor((u + depth / 2.0) / square) + np.floor((v + span) / square)) % 2 == 0
+    )
+
+    patch = rgb[y0:y1, x0:x1]
+    patch[on_line & light] = START_LINE_LIGHT
+    patch[on_line & ~light] = START_LINE_DARK
+
+    surface = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
+    pygame.image.save(surface, image_path)
+    return int(on_line.sum())
+
+
+def save_clearance_field(image_path, out_path):
+    """Write a greyscale map of how far each track pixel is from a wall.
+
+    The simulation ray-marches its radars through this: from any point it can
+    safely jump the distance stored there without passing through a wall, which
+    is both exact and far cheaper than testing every pixel along the ray.
+
+    The BFS distance is 4-connected, so it overestimates true (Euclidean)
+    distance by up to sqrt(2); car.py divides by 1.45 before stepping, which
+    keeps every jump conservative.
+    """
+    band = drivable_mask(load_rgb(image_path))
+    field = edge_distance(band)
+    field[~band] = 0
+    grey = np.clip(field, 0, 255).astype(np.uint8)
+
+    surface = pygame.surfarray.make_surface(
+        np.transpose(np.stack([grey] * 3, axis=2), (1, 0, 2))
+    )
+    pygame.image.save(surface, out_path)
+    return int(grey.max())
 
 
 def _polyline_length(points):
@@ -499,6 +687,11 @@ def _is_clean_ring(band):
 
 # --------------------------------------------------------------------------
 
+# Every track is one entry here. `image` is what the simulation loads; the
+# other keys say where that image comes from.
+#   (none)     hand-drawn art, used as-is
+#   outline    thin outline art, traced and painted into a drivable band
+#   geojson    a real circuit's centreline, projected and painted
 TRACKS = {
     "oval": {
         "image": "map.png",
@@ -506,14 +699,115 @@ TRACKS = {
         "checkpoint_spacing": 210.0,
         "spawn_hint": "green",
     },
-    "monza": {
-        "image": "assets/tracks/monza_track.png",
+    "monza_art": {
+        "image": "assets/tracks/monza_art.png",
         "outline": "assets/tracks/monza_custom_topdown.png",
         "half_width": 55,
         "line_spacing": 26.0,
         "checkpoint_spacing": 210.0,
     },
 }
+
+# The F1 calendar, built from real circuit geometry. Kept in season order.
+CALENDAR = [
+    ("australia", "au-1953", "Albert Park"),
+    ("china", "cn-2004", "Shanghai International Circuit"),
+    ("japan", "jp-1962", "Suzuka"),
+    ("bahrain", "bh-2002", "Bahrain International Circuit"),
+    ("saudi_arabia", "sa-2021", "Jeddah Corniche Circuit"),
+    ("miami", "us-2022", "Miami International Autodrome"),
+    ("canada", "ca-1978", "Circuit Gilles-Villeneuve"),
+    ("monaco", "mc-1929", "Circuit de Monaco"),
+    ("spain", "es-1991", "Circuit de Barcelona-Catalunya"),
+    ("austria", "at-1969", "Red Bull Ring"),
+    ("britain", "gb-1948", "Silverstone"),
+    ("belgium", "be-1925", "Spa-Francorchamps"),
+    ("hungary", "hu-1986", "Hungaroring"),
+    ("netherlands", "nl-1948", "Zandvoort"),
+    ("monza", "it-1922", "Autodromo Nazionale Monza"),
+    ("madrid", "es-2026", "Madring"),
+    ("azerbaijan", "az-2016", "Baku City Circuit"),
+    ("singapore", "sg-2008", "Marina Bay Street Circuit"),
+    ("usa", "us-2012", "Circuit of the Americas"),
+    ("mexico", "mx-1962", "Autodromo Hermanos Rodriguez"),
+    ("brazil", "br-1977", "Interlagos"),
+    ("las_vegas", "us-2023", "Las Vegas Strip Circuit"),
+    ("qatar", "qa-2004", "Losail International Circuit"),
+    ("abu_dhabi", "ae-2009", "Yas Marina Circuit"),
+]
+
+FRAME = (1920, 1080)
+FRAME_MARGIN = 46
+# Widest band worth painting, and the narrowest that is still worth driving.
+# A real circuit is roughly 480 times longer than it is wide, so a 5km lap drawn
+# as ~5000px would have a realistic band about 10px across. Every track here is
+# painted far wider than that on purpose; the floor is where there is no room
+# left to exaggerate, because the circuit genuinely runs alongside itself.
+TARGET_HALF_WIDTH = 48
+FLOOR_HALF_WIDTH = 15
+
+for _name, _circuit_id, _label in CALENDAR:
+    TRACKS[_name] = {
+        "image": f"assets/tracks/{_name}.png",
+        "geojson": f"assets/tracks/geo/{_circuit_id}.geojson",
+        "label": _label,
+        "half_width": TARGET_HALF_WIDTH,
+        "line_spacing": 26.0,
+        "checkpoint_spacing": 210.0,
+    }
+
+
+def build_one(name, spec):
+    """Build one track's image (if generated) and its metadata. None if it fails."""
+    image = os.path.join(ROOT, spec["image"])
+    generated = "outline" in spec or "geojson" in spec
+    extra = None
+    used = None
+
+    if "outline" in spec:
+        points, source_length, size = outline_centerline(
+            os.path.join(ROOT, spec["outline"])
+        )
+        used = paint_track(points, size, source_length, image,
+                           spec["half_width"], FLOOR_HALF_WIDTH)
+    elif "geojson" in spec:
+        geo = os.path.join(ROOT, spec["geojson"])
+        if not os.path.exists(geo):
+            print(f"{name}: no geometry at {spec['geojson']} - run tools/fetch_circuits.py")
+            return None
+        points, source_length, info = centerline_from_geojson(geo, FRAME, FRAME_MARGIN)
+        info["label"] = spec.get("label")
+        extra = info
+        used = paint_track(points, FRAME, source_length, image,
+                           spec["half_width"], FLOOR_HALF_WIDTH)
+
+    if generated and used is None:
+        print(f"{name}: SKIPPED - the circuit runs too close to itself to paint a "
+              f"drivable band wider than {FLOOR_HALF_WIDTH * 2}px without welding shut")
+        return None
+
+    meta = build_meta(
+        image,
+        name,
+        spec["line_spacing"],
+        spec["checkpoint_spacing"],
+        spec.get("spawn_hint"),
+        extra,
+    )
+    if generated:
+        # The source has no start/finish line, so draw one where the lap
+        # actually begins. After build_meta, so marker and spawn cannot drift.
+        paint_start_line(image, meta["spawn"], used)
+
+    clearance = os.path.splitext(image)[0] + "_clearance.png"
+    save_clearance_field(image, clearance)
+    meta["clearance_image"] = os.path.relpath(clearance, ROOT).replace(os.sep, "/")
+
+    out = os.path.join(ROOT, "assets", "tracks", f"{name}.json")
+    with open(out, "w") as handle:
+        json.dump(meta, handle, indent=2)
+        handle.write("\n")
+    return meta
 
 
 def main():
@@ -522,35 +816,28 @@ def main():
     args = parser.parse_args()
 
     pygame.init()
-    names = args.track or sorted(TRACKS)
+    names = args.track or list(TRACKS)
+    built, skipped = [], []
+
     for name in names:
-        spec = TRACKS[name]
-        image = os.path.join(ROOT, spec["image"])
-
-        if "outline" in spec:
-            used = paint_track_from_outline(
-                os.path.join(ROOT, spec["outline"]), image, spec["half_width"]
-            )
-            print(f"{name}: painted {spec['image']} at half-width {used}px")
-
-        meta = build_meta(
-            image,
-            name,
-            spec["line_spacing"],
-            spec["checkpoint_spacing"],
-            spec.get("spawn_hint"),
-        )
-        out = os.path.join(ROOT, "assets", "tracks", f"{name}.json")
-        with open(out, "w") as handle:
-            json.dump(meta, handle, indent=2)
-            handle.write("\n")
+        try:
+            meta = build_one(name, TRACKS[name])
+        except RuntimeError as error:
+            print(f"{name}: SKIPPED - {error}")
+            meta = None
+        if meta is None:
+            skipped.append(name)
+            continue
+        built.append(meta)
+        car = meta["car"]
         print(
-            f"{name}: {meta['length_px']}px lap, width ~{meta['median_width_px']}px, "
-            f"{len(meta['checkpoints'])} checkpoints, "
-            f"{len(meta['apex_indices'])} apexes, "
-            f"spawn ({meta['spawn']['x']},{meta['spawn']['y']}) @ {meta['spawn']['angle']}deg "
-            f"-> {os.path.relpath(out, ROOT)}"
+            f"{name:14s} {meta['length_px']:5d}px lap  band {meta['median_width_px']:3d}px "
+            f"({meta['width_in_cars']:.1f} cars)  car {car['size_x']}x{car['size_y']}px  "
+            f"{len(meta['checkpoints']):2d} cps  {len(meta['apex_indices'])} apexes"
         )
+
+    print(f"\n{len(built)} tracks built, {len(skipped)} skipped"
+          + (f": {', '.join(skipped)}" if skipped else ""))
     return 0
 
 

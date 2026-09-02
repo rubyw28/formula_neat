@@ -11,12 +11,32 @@ def distance_xy(a, b):
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
+_SPRITE_CACHE = {}
+
+
+def load_sprite(path, size):
+    """Load and scale the car sprite once per (file, size).
+
+    Every car used to re-read and re-scale the PNG from disk, for every car in
+    every generation. smoothscale rather than scale because the source art is
+    1059x476 and the car is a few dozen pixels: point-sampling a 30:1 reduction
+    throws away most of the car.
+    """
+    key = (path, size)
+    sprite = _SPRITE_CACHE.get(key)
+    if sprite is None:
+        sprite = pygame.image.load(path).convert_alpha()
+        sprite = pygame.transform.smoothscale(sprite, size)
+        _SPRITE_CACHE[key] = sprite
+    return sprite
+
+
 class Car:
     def __init__(self, spawn_x, spawn_y, spawn_angle, track_meta, sim_cfg):
         self.cfg = sim_cfg
-        self.sprite = pygame.image.load(self.cfg["car_sprite_path"]).convert_alpha()
-        self.sprite = pygame.transform.scale(
-            self.sprite, (self.cfg["car_size_x"], self.cfg["car_size_y"])
+        self.sprite = load_sprite(
+            self.cfg["car_sprite_path"],
+            (self.cfg["car_size_x"], self.cfg["car_size_y"]),
         )
         self.rotated_sprite = self.sprite
 
@@ -78,14 +98,11 @@ class Car:
         screen.blit(self.rotated_sprite, self.sprite_rect().topleft)
         if not debug_draw:
             return
-        # Draw a visible debug box so the car location is obvious.
-        rect = pygame.Rect(
-            int(self.position[0]),
-            int(self.position[1]),
-            self.cfg["car_size_x"],
-            self.cfg["car_size_y"],
-        )
-        pygame.draw.rect(screen, (30, 144, 255), rect, 1)
+        # Outline what actually collides: the rotated sprite's rectangle. The
+        # unrotated car_size_x by car_size_y box shares a centre with it but is
+        # the wrong shape as soon as the car turns, so it never matched the
+        # footprint the collision mask uses.
+        pygame.draw.rect(screen, (30, 144, 255), self.sprite_rect(), 1)
         for radar in self.radars:
             end_pos = radar[0]
             start_pos = (int(self.sensor_origin[0]), int(self.sensor_origin[1]))
@@ -128,48 +145,53 @@ class Car:
         self.alive = not out_of_bounds and border_mask.overlap(car_mask, offset) is None
 
     def check_radar(self, degree, game_map):
-        # Hoist the trig out of the walk. Doing it per pixel meant two sin/cos
-        # per step, up to 260 steps, five radars, every car, every tick - by far
-        # the most expensive thing in the simulation.
+        """Cast one radar from the nose and record where it meets a wall.
+
+        Marched, not walked pixel by pixel: the track's clearance field says how
+        far the nearest wall is from any point, so the ray can safely jump that
+        far in one go. Open track is crossed in a handful of steps and the
+        result is still exact, because within the clearance there is by
+        definition nothing to hit.
+
+        Without a clearance field it falls back to fixed steps of
+        `radar_coarse_step`, which is only safe when that is 1 - a larger stride
+        can straddle a wall at a glancing angle and report the far side of it.
+        """
         heading = math.radians(360 - (self.angle + degree))
         step_x = math.cos(heading)
         step_y = math.sin(heading)
         origin_x, origin_y = self.sensor_origin
 
         max_distance = self.cfg["radar_max_distance"]
-        border = self.cfg["border_color"]
         width = self.cfg["screen_width"]
         height = self.cfg["screen_height"]
-        coarse = self.cfg["radar_coarse_step"]
+        field = self.cfg.get("clearance_field")
+        border = self.cfg["border_color"]
+        fallback_step = max(1, self.cfg["radar_coarse_step"])
 
-        def blocked(length):
+        length = 0.0
+        x, y = int(origin_x), int(origin_y)
+        while length < max_distance:
             x = int(origin_x + step_x * length)
             y = int(origin_y + step_y * length)
             if x < 0 or y < 0 or x >= width or y >= height:
-                return True, x, y
-            return game_map.get_at((x, y)) == border, x, y
-
-        # Stride out in coarse steps, then walk the last stride pixel by pixel.
-        # Safe because the walls here are whole regions, not thin lines, so a
-        # stride can overshoot into one but cannot jump clean over it.
-        length = 0
-        x, y = int(origin_x), int(origin_y)
-        overshot = False
-        while length < max_distance:
-            probe = min(length + coarse, max_distance)
-            stop, probe_x, probe_y = blocked(probe)
-            if stop:
-                overshot = True
                 break
-            length, x, y = probe, probe_x, probe_y
-
-        if overshot:
-            for offset in range(1, coarse + 1):
-                probe = min(length + offset, max_distance)
-                stop, probe_x, probe_y = blocked(probe)
-                x, y = probe_x, probe_y
-                if stop:
+            if field is not None:
+                # 4-connected BFS overestimates true distance by up to sqrt(2),
+                # so scale it down before trusting it as a safe jump.
+                clear = field.get_at((x, y))[0]
+                if clear == 0:
                     break
+                # Half-pixel steps once we are alongside a wall. A ray running
+                # nearly parallel to the edge skims a one-pixel-wide strip, and
+                # at whole-pixel steps whether it clips the wall comes down to
+                # rounding; sub-sampling there costs almost nothing because it
+                # only happens in the last few pixels of a ray.
+                length += max(0.5, clear / 1.45)
+            else:
+                if game_map.get_at((x, y)) == border:
+                    break
+                length += fallback_step
 
         dist = int(math.hypot(x - origin_x, y - origin_y))
         self.radars.append([(x, y), dist])

@@ -42,6 +42,7 @@ class Track:
         self.width_px = self.meta["median_width_px"]
         self.surface = None
         self.border_mask = None
+        self.clearance = None
 
     @property
     def resolution(self):
@@ -51,11 +52,22 @@ class Track:
         """Build the render surface and the collision mask. Needs a display."""
         image = os.path.join(ROOT, self.meta["image"])
         self.surface = pygame.image.load(image).convert()
-        # Everything close to the border colour is a wall, which covers the
-        # anti-aliased pixels along the edge of the painted track.
+        # A wall is any pixel at or above 200 on every channel, which is the
+        # same definition tools/build_tracks.py uses for "off track" and the
+        # same one baked into the clearance field. Keeping collision, radar and
+        # clearance on one definition means a car cannot die a few pixels before
+        # its sensors say the wall is there.
         self.border_mask = pygame.mask.from_threshold(
-            self.surface, border_color[:3], (40, 40, 40, 255)
+            self.surface, border_color[:3], (55, 55, 55, 255)
         )
+
+        # Distance-to-wall map, used by the radars to ray-march instead of
+        # testing every pixel. Optional: a track without one still works.
+        clearance = self.meta.get("clearance_image")
+        if clearance:
+            path = os.path.join(ROOT, clearance)
+            if os.path.exists(path):
+                self.clearance = pygame.image.load(path).convert()
         return self
 
     def car_meta(self):
@@ -106,10 +118,14 @@ class Track:
             centre_y = point[1] + across[1] * side * lateral
 
             slots.append(
-                (
-                    centre_x - cfg["car_size_x"] / 2.0,
-                    centre_y - cfg["car_size_y"] / 2.0,
-                    angle,
-                )
+                {
+                    "x": centre_x - cfg["car_size_x"] / 2.0,
+                    "y": centre_y - cfg["car_size_y"] / 2.0,
+                    "angle": angle,
+                    # How far back down the road this slot starts. The back of a
+                    # 40-car grid is hundreds of pixels behind the line, and it
+                    # has to drive all of that before checkpoint 0 counts.
+                    "behind_px": row * row_gap * spacing,
+                }
             )
         return slots
