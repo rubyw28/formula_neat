@@ -92,6 +92,24 @@ def parse_args(argv):
         "so the 'override available' input behaves as it did in training)",
     )
     parser.add_argument("--seed", type=int, default=None, help="random seed")
+    parser.add_argument(
+        "--record",
+        default=None,
+        help="write an animated GIF of the run to this path (needs Pillow). "
+        "Works with --headless, which records as fast as the machine allows.",
+    )
+    parser.add_argument(
+        "--record-every", type=int, default=3,
+        help="capture one frame every N simulation ticks (default: 3, so 20fps)",
+    )
+    parser.add_argument(
+        "--record-seconds", type=float, default=13.0,
+        help="how much footage to capture (default: 13s)",
+    )
+    parser.add_argument(
+        "--record-width", type=int, default=760,
+        help="width of the recorded GIF in pixels (default: 760)",
+    )
     return parser.parse_args(argv)
 
 
@@ -127,15 +145,25 @@ def load_neat_config(path):
 # --------------------------------------------------------------------------
 
 
+class RecordingComplete(Exception):
+    """Raised to unwind out of NEAT's run loop once the GIF has enough frames."""
+
+
 class Simulation:
     """Runs generations of cars around a track and scores them."""
 
-    def __init__(self, args, cfg, track, screen, world, fonts):
+    def __init__(self, args, cfg, track, screen, world, fonts, canvas=None,
+                 recorder=None):
         self.args = args
         self.cfg = cfg
         self.track = track
         self.screen = screen
         self.world = world
+        # What the HUD is drawn onto and what gets shown or recorded: the window
+        # itself when there is one, otherwise an offscreen surface.
+        self.canvas = canvas if canvas is not None else screen
+        self.visible = not args.headless
+        self.recorder = recorder
         self.fonts = fonts
 
         self.generation = 0
@@ -144,6 +172,7 @@ class Simulation:
         self.show_hud = True
         self.debug = args.debug
         self.ticks_per_frame = 1
+        self.hud_scale = 1.0
         self.started = time.time()
         # "GEN" while training, "RUN" while replaying a saved genome.
         self.round_label = "GEN"
@@ -175,11 +204,11 @@ class Simulation:
             car.spawn_grace = int(slot["behind_px"] / pace)
             cars.append(car)
 
-        clock = pygame.time.Clock() if not self.args.headless else None
+        clock = pygame.time.Clock() if self.visible else None
         skip = False
 
         for tick in range(self.args.ticks):
-            if not self.args.headless:
+            if self.visible:
                 skip = self.handle_events()
                 if skip:
                     break
@@ -188,9 +217,12 @@ class Simulation:
             if alive == 0:
                 break
 
-            if not self.args.headless and tick % self.ticks_per_frame == 0:
+            if tick % self.ticks_per_frame == 0 and (
+                self.visible or self.recorder is not None
+            ):
                 self.render(cars, tick, alive, len(genomes))
-                clock.tick(self.args.fps)
+                if clock is not None:
+                    clock.tick(self.args.fps)
 
         self._finish_generation(genomes, cars)
 
@@ -304,20 +336,24 @@ class Simulation:
             if car.is_alive():
                 car.draw(world, self.debug)
 
-        # Scale the track and cars down to the window FIRST, then draw the HUD
-        # on top at the window's own resolution. Drawing the HUD into the
-        # 1920x1080 world surface sent its text through the same downscale as
-        # the track, and at the 0.725 a 1512px-wide desktop forces, 14px glyphs
-        # came out mangled - "BATTERY" rendered as "BATTFRY". smoothscale rather
-        # than scale so the track edges and the car sprite survive the shrink.
-        if world is not self.screen:
-            pygame.transform.smoothscale(world, self.screen.get_size(), self.screen)
+        # Scale the track and cars down to the output size FIRST, then draw the
+        # HUD on top at that size. Drawing the HUD into the 1920x1080 world
+        # surface sent its text through the same downscale as the track, and at
+        # the 0.725 a 1512px-wide desktop forces, 14px glyphs came out mangled -
+        # "BATTERY" rendered as "BATTFRY". smoothscale rather than scale so the
+        # track edges and the car sprite survive the shrink.
+        canvas = self.canvas
+        if world is not canvas:
+            pygame.transform.smoothscale(world, canvas.get_size(), canvas)
 
         leader = self._leader(cars)
         if self.show_hud:
-            self._draw_hud(self.screen, leader, tick, alive, total)
+            self._draw_hud(canvas, leader, tick, alive, total)
 
-        pygame.display.flip()
+        if self.visible:
+            pygame.display.flip()
+        if self.recorder is not None and not self.recorder.capture(canvas):
+            raise RecordingComplete
 
     def _draw_track_debug(self, surface):
         import pygame
@@ -342,15 +378,27 @@ class Simulation:
         return best[1] if best else None
 
     def _draw_hud(self, surface, leader, tick, alive, total):
+        """Draw the telemetry panel at the size the output actually is.
+
+        Every measurement is scaled by `hud_scale`, which main.py derives from
+        the width of whatever is being drawn to. A panel sized in fixed pixels
+        looked right in a full-size window and swallowed most of the frame in a
+        half-scale one or a recorded GIF.
+        """
         import pygame
 
         small, body, big = self.fonts
-        width, height = 372, 310
+        k = self.hud_scale
+
+        def u(value):
+            return int(round(value * k))
+
+        width, height = u(372), u(310)
         panel = pygame.Surface((width, height), pygame.SRCALPHA)
         panel.fill(PANEL_BG)
 
         def text(font, value, x, y, colour=INK):
-            panel.blit(font.render(value, True, colour), (x, y))
+            panel.blit(font.render(value, True, colour), (u(x), u(y)))
 
         text(big, f"{self.round_label} {self.generation}", 16, 12)
         text(small, self.track.name.upper(), 16, 46, ACCENT)
@@ -363,7 +411,9 @@ class Simulation:
         wall = int(time.time() - self.started)
         text(body, f"{wall // 60}m{wall % 60:02d}s", 236, 112, DIM)
 
-        pygame.draw.line(panel, (60, 66, 78), (16, 136), (width - 16, 136))
+        pygame.draw.line(
+            panel, (60, 66, 78), (u(16), u(136)), (width - u(16), u(136))
+        )
         text(small, "LEADER", 16, 144, ACCENT)
 
         if leader is None:
@@ -388,12 +438,12 @@ class Simulation:
                 GOOD if leader.override_active else (WARN if leader.override_allowed else DIM),
             )
 
-            self._bar(panel, 16, 216, width - 32, "BATTERY", leader.battery_energy, ACCENT)
-            self._bar(panel, 16, 246, width - 32, "TYRE", 1.0 - leader.tire_wear, GOOD)
+            self._bar(panel, 16, 216, 372 - 32, "BATTERY", leader.battery_energy, ACCENT)
+            self._bar(panel, 16, 246, 372 - 32, "TYRE", 1.0 - leader.tire_wear, GOOD)
 
             load = leader.corner_load_ratio
-            # Values are clamped for display: a car mid-crash can post a
-            # three-figure g reading, which would run off the panel.
+            # Clamped for display: a car mid-crash can post a three-figure g
+            # reading, which would run off the panel.
             text(
                 body,
                 f"lap {leader.completed_laps:<2d} cp {leader.next_checkpoint:>2d}/"
@@ -404,24 +454,32 @@ class Simulation:
                 WARN if load > 0.85 else INK,
             )
 
-        surface.blit(panel, (24, 24))
+        surface.blit(panel, (u(24), u(24)))
 
     def _bar(self, panel, x, y, width, label, value, colour):
+        """A labelled meter. Coordinates are in unscaled design units."""
         import pygame
 
         small = self.fonts[0]
+        k = self.hud_scale
+
+        def u(value):
+            return int(round(value * k))
+
         value = max(0.0, min(1.0, value))
-        panel.blit(small.render(label, True, DIM), (x, y - 2))
-        track_rect = pygame.Rect(x + 78, y + 1, width - 78 - 44, 12)
-        pygame.draw.rect(panel, (46, 50, 60), track_rect, border_radius=3)
+        panel.blit(small.render(label, True, DIM), (u(x), u(y - 2)))
+        track_rect = pygame.Rect(
+            u(x + 78), u(y + 1), u(width - 78 - 44), max(4, u(12))
+        )
+        pygame.draw.rect(panel, (46, 50, 60), track_rect, border_radius=u(3))
         if value > 0:
             filled = track_rect.copy()
             filled.width = max(2, int(track_rect.width * value))
             shade = colour if value > 0.2 else WARN
-            pygame.draw.rect(panel, shade, filled, border_radius=3)
+            pygame.draw.rect(panel, shade, filled, border_radius=u(3))
         panel.blit(
             small.render(f"{value * 100:3.0f}%", True, INK),
-            (x + width - 38, y - 2),
+            (u(x + width - 38), u(y - 2)),
         )
 
     @staticmethod
@@ -446,7 +504,8 @@ def load_genome(path):
     return payload, None
 
 
-def replay(args, cfg, track, screen, world, fonts):
+def replay(args, cfg, track, screen, world, fonts, canvas=None, recorder=None,
+           hud_scale=1.0):
     """Drive a saved genome around the track on repeat."""
     import neat
     import pygame
@@ -460,11 +519,21 @@ def replay(args, cfg, track, screen, world, fonts):
         )
     net = neat.nn.FeedForwardNetwork.create(genome, neat_config)
 
-    sim = Simulation(args, cfg, track, screen, world, fonts)
+    sim = Simulation(args, cfg, track, screen, world, fonts, canvas, recorder)
+    sim.hud_scale = hud_scale
     sim.round_label = "RUN"
     clock = pygame.time.Clock()
     meta = track.car_meta()
 
+    try:
+        _replay_loop(args, cfg, track, sim, net, meta, clock)
+    except RecordingComplete:
+        pass
+    finish_recording(recorder)
+    return 0
+
+
+def _replay_loop(args, cfg, track, sim, net, meta, clock):
     while True:
         sim.generation += 1
         # A field, not a lone car. Training runs 40 cars nose to tail, which
@@ -504,9 +573,10 @@ def replay(args, cfg, track, screen, world, fonts):
                 break
             sim.best_laps = max(sim.best_laps, max(c.completed_laps for c in cars))
             sim.best_fitness = max(sim.best_fitness, fitness)
-            if not args.headless and tick % sim.ticks_per_frame == 0:
+            if tick % sim.ticks_per_frame == 0 and (sim.visible or sim.recorder):
                 sim.render(cars, tick, alive, len(cars))
-                clock.tick(args.fps)
+                if sim.visible:
+                    clock.tick(args.fps)
 
         leader = max(cars, key=lambda c: (c.completed_laps, c.next_checkpoint))
         print(
@@ -514,7 +584,7 @@ def replay(args, cfg, track, screen, world, fonts):
             f"best of field: {leader.completed_laps} laps, "
             f"{leader.next_checkpoint}/{len(track.meta['checkpoints'])} checkpoints"
         )
-        if args.headless:
+        if args.headless and recorder is None:
             return 0
 
 
@@ -548,9 +618,29 @@ def main(argv=None):
     world_size = track.resolution
     cfg["screen_width"], cfg["screen_height"] = world_size
 
+    recorder = None
+    if args.record:
+        from recorder import Recorder
+
+        recorder = Recorder(
+            args.record,
+            every=args.record_every,
+            max_frames=max(1, int(round(
+                args.record_seconds * cfg["fps"] / max(1, args.record_every)
+            ))),
+            width=args.record_width,
+            fps=cfg["fps"],
+        )
+
+    canvas = None
     if args.headless:
         screen = pygame.display.set_mode((1, 1))
         world = pygame.Surface(world_size)
+        if recorder is not None:
+            # No window to draw into, so give the HUD and the recorder a
+            # surface of their own at the output size.
+            height = int(round(world_size[1] * args.record_width / world_size[0]))
+            canvas = pygame.Surface((args.record_width, height))
     else:
         scale = args.scale
         if scale is None:
@@ -578,17 +668,23 @@ def main(argv=None):
         pace = cfg["max_speed_base"] * 0.45
         args.ticks = int(min(6000, max(900, round(track.length_px / pace * 1.7))))
 
-    # Sized for the window's own pixels, since the HUD is drawn after the
-    # world is scaled down rather than being scaled along with it.
+    if canvas is None:
+        canvas = screen
+
+    # Sized for whatever is actually being drawn to - a window, or a recording
+    # canvas - since the HUD is drawn after the world is scaled rather than
+    # being scaled along with it. 1250px is the reference design width.
+    hud_scale = max(0.60, min(1.15, canvas.get_width() / 1250.0))
     mono = "menlo,consolas,dejavusansmono,couriernew,monospace"
     fonts = (
-        pygame.font.SysFont(mono, 15),
-        pygame.font.SysFont(mono, 17),
-        pygame.font.SysFont(mono, 30, bold=True),
+        pygame.font.SysFont(mono, max(8, int(round(15 * hud_scale)))),
+        pygame.font.SysFont(mono, max(9, int(round(17 * hud_scale)))),
+        pygame.font.SysFont(mono, max(14, int(round(30 * hud_scale))), bold=True),
     )
 
     if args.replay:
-        return replay(args, cfg, track, screen, world, fonts)
+        return replay(args, cfg, track, screen, world, fonts, canvas, recorder,
+                      hud_scale)
 
     if args.save_best is None:
         args.save_best = os.path.join(ROOT, f"best_{track.name}.pkl")
@@ -624,10 +720,25 @@ def main(argv=None):
         f"{' | headless' if args.headless else ''}\n"
     )
 
-    sim = Simulation(args, cfg, track, screen, world, fonts)
+    sim = Simulation(args, cfg, track, screen, world, fonts, canvas, recorder)
+    sim.hud_scale = hud_scale
     sim.best_fitness = sim_best
-    population.run(sim.evaluate, args.generations)
+    try:
+        population.run(sim.evaluate, args.generations)
+    except RecordingComplete:
+        pass
+    finally:
+        finish_recording(recorder)
     return 0
+
+
+def finish_recording(recorder):
+    if recorder is None:
+        return
+    if recorder.save():
+        print(f"\nrecorded {recorder.summary()}")
+    else:
+        print("\nnothing was recorded")
 
 
 if __name__ == "__main__":
