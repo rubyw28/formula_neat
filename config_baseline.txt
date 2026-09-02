@@ -1,25 +1,18 @@
-# NEAT settings for the current physics model: car.py driven by main.py.
-#
-# 13 inputs : 5 nose radars, speed, grip, battery, aero mode, override
-#             availability, cornering load, distance and heading to the next
-#             checkpoint.
-#  5 outputs: steer, throttle, brake, aero mode, override request.
-#
-# The 5-input / 6-action baseline in newcar.py uses config_baseline.txt.
+# NEAT settings for the ORIGINAL baseline in newcar.py.
+# 5 radar inputs, 6 discrete actions. Frozen for A/B comparison.
+# The current physics model (car.py + main.py) uses config.txt instead.
 
 [NEAT]
-fitness_criterion      = max
-fitness_threshold      = 100000000
-pop_size               = 40
-reset_on_extinction    = True
+fitness_criterion     = max
+fitness_threshold     = 100000000
+pop_size              = 30
+reset_on_extinction   = True
 no_fitness_termination = False
 
 [DefaultGenome]
 # node activation options
-# tanh keeps every output in -1..1, which is the range car.py expects for
-# steering and what it rescales into 0..1 for throttle and brake.
 activation_default      = tanh
-activation_mutate_rate  = 0.03
+activation_mutate_rate  = 0.01
 activation_options      = tanh
 
 # node aggregation options
@@ -42,7 +35,7 @@ compatibility_weight_coefficient   = 0.5
 
 # connection add/remove rates
 conn_add_prob           = 0.5
-conn_delete_prob        = 0.4
+conn_delete_prob        = 0.5
 
 # connection enable options
 enabled_default         = True
@@ -52,13 +45,13 @@ feed_forward            = True
 initial_connection      = full
 
 # node add/remove rates
-node_add_prob           = 0.25
-node_delete_prob        = 0.15
+node_add_prob           = 0.2
+node_delete_prob        = 0.2
 
 # network parameters
 num_hidden              = 0
-num_inputs              = 13
-num_outputs             = 5
+num_inputs              = 5
+num_outputs             = 6
 
 # node response options
 response_init_mean      = 1.0
@@ -79,9 +72,7 @@ weight_mutate_rate      = 0.8
 weight_replace_rate     = 0.1
 
 [DefaultSpeciesSet]
-# Higher than the baseline's 2.0: a 13x5 starting genome has far more
-# connections, so genome distances are larger for the same real difference.
-compatibility_threshold = 3.0
+compatibility_threshold = 2.0
 
 [DefaultStagnation]
 species_fitness_func = max

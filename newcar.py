@@ -393,7 +393,10 @@ def run_simulation(genomes, config):
 
 
 if __name__ == "__main__":
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.txt")
+    # Frozen baseline: config.txt now belongs to the car.py physics model.
+    config_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "config_baseline.txt"
+    )
     neat_config = neat.config.Config(
         neat.DefaultGenome,
         neat.DefaultReproduction,

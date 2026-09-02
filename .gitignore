@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Trained genomes and generated previews
+best_*.pkl
+preview_*.png
+
+# Local virtualenvs, if you keep one in the project
+.venv/
+venv/

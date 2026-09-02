@@ -64,9 +64,18 @@ class Car:
         self.apex_indices = set(track_meta.get("apex_indices", []))
 
         self.reward_delta = 0.0
+        # Cursor into racing_line, so the nearest-point search can start local.
+        self._line_index = -1
+        self._line_search_span = 14
+
+    def sprite_rect(self):
+        """Where the rotated sprite sits on screen, centred on the car."""
+        rect = self.rotated_sprite.get_rect()
+        rect.center = (int(self.center[0]), int(self.center[1]))
+        return rect
 
     def draw(self, screen, debug_draw):
-        screen.blit(self.rotated_sprite, self.position)
+        screen.blit(self.rotated_sprite, self.sprite_rect().topleft)
         if not debug_draw:
             return
         # Draw a visible debug box so the car location is obvious.
@@ -101,15 +110,15 @@ class Car:
         self.sensor_origin = [self.center[0] + nose_dx, self.center[1] + nose_dy]
 
     def rotate_center(self, image, angle):
-        rectangle = image.get_rect()
-        rotated_image = pygame.transform.rotate(image, angle)
-        rotated_rectangle = rectangle.copy()
-        rotated_rectangle.center = rotated_image.get_rect().center
-        return rotated_image.subsurface(rotated_rectangle).copy()
+        # Keep the whole rotated image. Cropping it back to the unrotated rect
+        # is impossible past ~45deg - a rotated 34x16 car is only 16px wide at
+        # 90deg - and it would clip the nose and tail off the collision mask.
+        # sprite_rect() is what re-centres it on the car.
+        return pygame.transform.rotate(image, angle)
 
     def check_collision(self, border_mask):
         car_mask = pygame.mask.from_surface(self.rotated_sprite)
-        offset = (int(self.position[0]), int(self.position[1]))
+        offset = self.sprite_rect().topleft
         out_of_bounds = (
             self.position[0] < 0
             or self.position[1] < 0
@@ -119,45 +128,91 @@ class Car:
         self.alive = not out_of_bounds and border_mask.overlap(car_mask, offset) is None
 
     def check_radar(self, degree, game_map):
+        # Hoist the trig out of the walk. Doing it per pixel meant two sin/cos
+        # per step, up to 260 steps, five radars, every car, every tick - by far
+        # the most expensive thing in the simulation.
+        heading = math.radians(360 - (self.angle + degree))
+        step_x = math.cos(heading)
+        step_y = math.sin(heading)
+        origin_x, origin_y = self.sensor_origin
+
+        max_distance = self.cfg["radar_max_distance"]
+        border = self.cfg["border_color"]
+        width = self.cfg["screen_width"]
+        height = self.cfg["screen_height"]
+        coarse = self.cfg["radar_coarse_step"]
+
+        def blocked(length):
+            x = int(origin_x + step_x * length)
+            y = int(origin_y + step_y * length)
+            if x < 0 or y < 0 or x >= width or y >= height:
+                return True, x, y
+            return game_map.get_at((x, y)) == border, x, y
+
+        # Stride out in coarse steps, then walk the last stride pixel by pixel.
+        # Safe because the walls here are whole regions, not thin lines, so a
+        # stride can overshoot into one but cannot jump clean over it.
         length = 0
-        x = int(self.sensor_origin[0])
-        y = int(self.sensor_origin[1])
-        while length < self.cfg["radar_max_distance"]:
-            x = int(
-                self.sensor_origin[0]
-                + math.cos(math.radians(360 - (self.angle + degree))) * length
-            )
-            y = int(
-                self.sensor_origin[1]
-                + math.sin(math.radians(360 - (self.angle + degree))) * length
-            )
-            if (
-                x < 0
-                or y < 0
-                or x >= self.cfg["screen_width"]
-                or y >= self.cfg["screen_height"]
-            ):
+        x, y = int(origin_x), int(origin_y)
+        overshot = False
+        while length < max_distance:
+            probe = min(length + coarse, max_distance)
+            stop, probe_x, probe_y = blocked(probe)
+            if stop:
+                overshot = True
                 break
-            if game_map.get_at((x, y)) == self.cfg["border_color"]:
-                break
-            length += 1
-        dist = int(
-            math.sqrt(
-                (x - self.sensor_origin[0]) ** 2 + (y - self.sensor_origin[1]) ** 2
-            )
-        )
+            length, x, y = probe, probe_x, probe_y
+
+        if overshot:
+            for offset in range(1, coarse + 1):
+                probe = min(length + offset, max_distance)
+                stop, probe_x, probe_y = blocked(probe)
+                x, y = probe_x, probe_y
+                if stop:
+                    break
+
+        dist = int(math.hypot(x - origin_x, y - origin_y))
         self.radars.append([(x, y), dist])
 
     def _nearest_racing_line_distance(self):
         if not self.racing_line:
             return 0.0, -1
+
+        count = len(self.racing_line)
+        # The car only moves a few pixels a tick, so the nearest racing-line
+        # point is next to last tick's. Scanning the whole line every tick for
+        # every car was the second most expensive thing here.
+        if self._line_index < 0:
+            candidates = range(count)
+        else:
+            span = self._line_search_span
+            candidates = [
+                (self._line_index + offset) % count
+                for offset in range(-span, span + 1)
+            ]
+
         best_dist = 1e9
         best_idx = -1
-        for i, point in enumerate(self.racing_line):
-            d = distance_xy(self.center, point)
+        best_offset = 0
+        for position, i in enumerate(candidates):
+            d = distance_xy(self.center, self.racing_line[i])
             if d < best_dist:
                 best_dist = d
                 best_idx = i
+                best_offset = position
+
+        # If the winner sits on the edge of the window we may have missed a
+        # closer point outside it, so fall back to the full sweep.
+        if self._line_index >= 0 and best_offset in (0, len(candidates) - 1):
+            best_dist = 1e9
+            best_idx = -1
+            for i, point in enumerate(self.racing_line):
+                d = distance_xy(self.center, point)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+
+        self._line_index = best_idx
         return best_dist, best_idx
 
     def _update_checkpoint_progress(self):
@@ -168,14 +223,14 @@ class Car:
         cp_dist = distance_xy(self.center, (cp["x"], cp["y"]))
         if cp_dist > cp_radius:
             return 0.0
-        reward = 18.0
+        reward = self.cfg["reward_checkpoint"]
         self.next_checkpoint += 1
         self.last_checkpoint_tick = self.time
         if self.next_checkpoint >= len(self.checkpoints):
             self.next_checkpoint = 0
             self.completed_laps += 1
             self.lap_ticks = self.time
-            reward += 220.0
+            reward += self.cfg["reward_lap"]
         return reward
 
     def _update_tire_wear(self):
@@ -340,17 +395,28 @@ class Car:
         for degree in self.cfg["radar_angles"]:
             self.check_radar(degree, game_map)
 
+        cfg = self.cfg
         checkpoint_reward = self._update_checkpoint_progress()
         line_dist, line_idx = self._nearest_racing_line_distance()
-        line_reward = clamp(1.7 - (line_dist / 55.0), -1.0, 1.7)
-        apex_bonus = 2.2 if line_idx in self.apex_indices and line_dist < 25 else 0.0
+        line_reward = cfg["reward_line_max"] * clamp(
+            1.0 - (line_dist / cfg["reward_line_falloff"]), -2.0, 1.0
+        )
+        apex_bonus = (
+            cfg["reward_apex"]
+            if line_idx in self.apex_indices and line_dist < 25
+            else 0.0
+        )
 
         # Efficient pace: reward speed with battery discipline.
-        pace_reward = 0.02 * self.speed
-        low_battery_penalty = 1.0 if self.battery_energy < 0.12 else 0.0
-        battery_efficiency_bonus = 0.4 if self.battery_energy > 0.35 else 0.0
-        time_penalty = 0.05
-        steering_penalty = 0.01 * abs(steer_input)
+        pace_reward = cfg["reward_pace"] * self.speed
+        low_battery_penalty = (
+            cfg["penalty_battery_low"] if self.battery_energy < 0.12 else 0.0
+        )
+        battery_efficiency_bonus = (
+            cfg["reward_battery_ok"] if self.battery_energy > 0.35 else 0.0
+        )
+        time_penalty = cfg["penalty_time"]
+        steering_penalty = cfg["penalty_steering"] * abs(steer_input)
         self.reward_delta = (
             checkpoint_reward
             + line_reward
