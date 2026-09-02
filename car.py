@@ -84,6 +84,10 @@ class Car:
         self.apex_indices = set(track_meta.get("apex_indices", []))
 
         self.reward_delta = 0.0
+        # Apexes already collected this lap. Without this the apex bonus pays
+        # out every tick the car sits near one, and parking on an apex earns
+        # more than driving half the circuit.
+        self._apexes_hit = set()
         # Cursor into racing_line, so the nearest-point search can start local.
         self._line_index = -1
         self._line_search_span = 14
@@ -252,6 +256,7 @@ class Car:
             self.next_checkpoint = 0
             self.completed_laps += 1
             self.lap_ticks = self.time
+            self._apexes_hit.clear()
             reward += self.cfg["reward_lap"]
         return reward
 
@@ -423,11 +428,18 @@ class Car:
         line_reward = cfg["reward_line_max"] * clamp(
             1.0 - (line_dist / cfg["reward_line_falloff"]), -2.0, 1.0
         )
-        apex_bonus = (
-            cfg["reward_apex"]
-            if line_idx in self.apex_indices and line_dist < 25
-            else 0.0
-        )
+        # One payment per apex per lap, like a checkpoint. Paying it per tick
+        # made standing still on an apex the highest-scoring thing a car could
+        # do: 2.2 a tick for the whole stall window beat driving 12 of the
+        # circuit's 29 checkpoints.
+        apex_bonus = 0.0
+        if (
+            line_idx in self.apex_indices
+            and line_dist < 25
+            and line_idx not in self._apexes_hit
+        ):
+            self._apexes_hit.add(line_idx)
+            apex_bonus = cfg["reward_apex"]
 
         # Efficient pace: reward speed with battery discipline.
         pace_reward = cfg["reward_pace"] * self.speed

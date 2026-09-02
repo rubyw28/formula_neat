@@ -584,8 +584,10 @@ def _replay_loop(args, cfg, track, sim, net, meta, clock):
             f"best of field: {leader.completed_laps} laps, "
             f"{leader.next_checkpoint}/{len(track.meta['checkpoints'])} checkpoints"
         )
-        if args.headless and recorder is None:
-            return 0
+        if args.headless and sim.recorder is None:
+            # Nothing is watching and nothing is being captured, so one run
+            # is all a headless replay can usefully do.
+            return
 
 
 # --------------------------------------------------------------------------
